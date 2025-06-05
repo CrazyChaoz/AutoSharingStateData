@@ -20,10 +20,10 @@
 //! ```
 //!
 
-use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
+use arti_client::config::TorClientConfigBuilder;
 use automerge::{self, AutoCommit};
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures::{Stream, StreamExt};
@@ -31,7 +31,7 @@ use futures_util::task::SpawnExt;
 use http_body_util::BodyExt;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{header, Request, Response, StatusCode, Uri};
+use hyper::{Request, Response, StatusCode, Uri, header};
 use hyper_util::rt::TokioIo;
 use log::{error, info};
 use rand::RngCore;
@@ -158,6 +158,17 @@ pub struct AutoSharedDocument<
     /// This is used to ensure the type parameter is retained in the struct's type signature.
     _phantom: std::marker::PhantomData<SharedDataType>,
 }
+
+/// Implementation block for the `AutoSharedDocument` struct.
+///
+/// This block defines methods for managing shared and local data, syncing documents,
+/// and interacting with Tor onion services.
+///
+/// # Type Parameters
+/// - `SharedDataType`: The type of data stored in the shared state. Must implement
+///   `Reconcile`, `Hydrate`, `Clone`, `Serialize`, `DeserializeOwned`, `Debug`, and `Sync`.
+/// - `LocalDataType`: The type of data stored in the local-only state. Must implement
+///   `DeserializeOwned`, `Serialize`, `Clone`, `Debug`, and `Sync`.
 impl<SharedDataType, LocalDataType> AutoSharedDocument<SharedDataType, LocalDataType>
 where
     SharedDataType: Reconcile
@@ -530,13 +541,32 @@ where
         }
     }
 
-    /// Save the shared state to a file
+    /// Saves the shared state to a file.
+    ///
+    /// This method locks the shared state, hydrates it into a `SharedState` instance,
+    /// and then delegates the saving process to the `save_shared_state_inner` function.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the shared state is successfully saved.
+    /// - `Err(std::io::Error)`: If an error occurs during the saving process.
     pub fn save_shared_state(&self) -> Result<(), std::io::Error> {
         let document = self.shared_state.lock().unwrap().clone();
         let shared_state: SharedState<SharedDataType> = hydrate(&document).unwrap();
         Self::save_shared_state_inner(&shared_state, self.data_dir.clone())
     }
 
+    /// Saves the shared state to a file at the specified directory.
+    ///
+    /// This function creates a file named `shared_state.json` in the given directory
+    /// and writes the serialized shared state into it.
+    ///
+    /// # Parameters
+    /// - `shared_state`: A reference to the `SharedState` instance to be saved.
+    /// - `data_dir`: The directory path where the file will be created.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the shared state is successfully saved.
+    /// - `Err(std::io::Error)`: If an error occurs during file creation or writing.
     fn save_shared_state_inner(
         shared_state: &SharedState<SharedDataType>,
         data_dir: String,
@@ -547,7 +577,14 @@ where
         Ok(())
     }
 
-    /// Save the local data to a file
+    /// Saves the local-only data to a file.
+    ///
+    /// This method locks the local data, clones it, and writes it to a file named `local_only.json`
+    /// in the directory specified by `data_dir`. The data is serialized in a pretty JSON format.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the local data is successfully saved.
+    /// - `Err(std::io::Error)`: If an error occurs during file creation or writing.
     pub fn save_local_data(&self) -> Result<(), std::io::Error> {
         let local_data_path = format!("{}local_only.json", self.data_dir);
         let local_data = self.local_data.lock().unwrap().clone();
@@ -556,7 +593,18 @@ where
         Ok(())
     }
 
-    /// Add an onion address to the list of allowed addresses and save the shared state
+    /// Adds an onion address to the list of allowed addresses and saves the shared state.
+    ///
+    /// This method updates the shared state by adding the specified onion address to the list
+    /// of allowed addresses. It uses Autosurgeon to reconcile the updated state with the document
+    /// and then saves the updated shared state to persistent storage.
+    ///
+    /// # Parameters
+    /// - `address`: The onion address to be added to the list of allowed addresses.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the onion address is successfully added and the shared state is saved.
+    /// - `Err(std::io::Error)`: If an error occurs during the saving process.
     pub fn add_allowed_onion_address(&self, address: String) -> Result<(), std::io::Error> {
         let mut forked_doc = self
             .shared_state
@@ -575,7 +623,17 @@ where
         self.save_shared_state()
     }
 
-    /// Check if an onion address is allowed to sync
+    /// Checks if the specified onion address is allowed to sync.
+    ///
+    /// This method examines the shared state to determine whether the given onion address
+    /// is included in the list of allowed addresses.
+    ///
+    /// # Parameters
+    /// - `address`: A string slice representing the onion address to check.
+    ///
+    /// # Returns
+    /// - `true`: If the onion address is allowed to sync.
+    /// - `false`: If the onion address is not allowed to sync.
     pub fn is_onion_address_allowed(&self, address: &str) -> bool {
         let locked_doc = self.shared_state.lock().unwrap().clone();
         let hydrated_state: SharedState<SharedDataType> = hydrate(&locked_doc).unwrap();
@@ -584,6 +642,19 @@ where
             .contains(&address.to_string())
     }
 
+    /// Sets a value in the shared state.
+    ///
+    /// This method locks the shared state, hydrates it into a `SharedState` instance,
+    /// and inserts the specified key-value pair into the `data` field of the shared state.
+    /// The updated state is then reconciled with the document and saved to persistent storage.
+    ///
+    /// # Parameters
+    /// - `key`: A string slice representing the key to be added or updated in the shared state.
+    /// - `value`: The value of type `SharedDataType` to be associated with the specified key.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the value is successfully set and the shared state is saved.
+    /// - `Err(std::io::Error)`: If an error occurs during the saving process.
     pub fn set_value(&self, key: &str, value: SharedDataType) -> Result<(), Error> {
         let mut locked_doc = self
             .shared_state
@@ -678,12 +749,37 @@ where
         get_onion_address(&pk.to_bytes())
     }
 }
+
+/// Generates a new 32-byte secret key.
+///
+/// This function uses a random number generator to fill a 32-byte array
+/// with random values, which can be used as a secret key.
+///
+/// # Returns
+/// A `[u8; 32]` array containing the generated secret key.
 pub fn generate_key() -> [u8; 32] {
     let mut rng = rand::rng();
     let mut sk = [0u8; 32];
     rng.fill_bytes(&mut sk);
     sk
 }
+
+/// Generates a Tor onion address from a given public key.
+///
+/// This function computes the onion address by performing the following steps:
+/// 1. Converts the provided public key into a fixed-size array.
+/// 2. Constructs a buffer containing the public key, checksum, and version.
+/// 3. Calculates the checksum using the SHA3-256 hash function.
+/// 4. Encodes the buffer into a base32 string to produce the onion address.
+///
+/// # Parameters
+/// - `public_key`: A byte slice representing the public key. Must be convertible to a `[u8; 32]` array.
+///
+/// # Returns
+/// A `String` containing the generated onion address.
+///
+/// # Panics
+/// - If the `public_key` cannot be converted to a `[u8; 32]` array.
 pub fn get_onion_address(public_key: &[u8]) -> String {
     let pub_key = <[u8; 32]>::try_from(public_key).expect("could not convert to [u8; 32]");
     let mut buf = [0u8; 35];
@@ -703,7 +799,6 @@ pub fn get_onion_address(public_key: &[u8]) -> String {
 
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &buf).to_ascii_lowercase()
 }
-
 pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
     panic::catch_unwind(|| {
         let mut res_vec: Vec<u8> = base32::decode(
@@ -723,6 +818,24 @@ pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
     })
 }
 
+/// Verifies the signature of the given data using the provided public key.
+///
+/// This function attempts to verify the signature by:
+/// 1. Converting the public key into a `VerifyingKey`.
+/// 2. Using the `verify` method to check if the signature matches the data.
+/// If the verification fails or an error occurs during the process, it returns `false`.
+///
+/// # Parameters
+/// - `data`: A string slice representing the data to be verified.
+/// - `signature`: A byte slice containing the signature to verify.
+/// - `public_key`: A byte slice representing the public key used for verification.
+///
+/// # Returns
+/// - `true`: If the signature is valid.
+/// - `false`: If the signature is invalid or an error occurs.
+///
+/// # Panics
+/// - If the `public_key` or `signature` cannot be converted to their respective types.
 pub fn verify_signature(data: &str, signature: &[u8], public_key: &[u8]) -> bool {
     panic::catch_unwind(|| {
         let verifying_key =
