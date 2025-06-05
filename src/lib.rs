@@ -20,18 +20,19 @@
 //! ```
 //!
 
-use arti_client::TorClient;
 use arti_client::config::TorClientConfigBuilder;
+use arti_client::TorClient;
 use automerge::{self, AutoCommit};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
+use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures::{Stream, StreamExt};
 use futures_util::task::SpawnExt;
 use http_body_util::BodyExt;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri, header};
+use hyper::{header, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use log::{error, info};
 use rand::RngCore;
@@ -89,7 +90,7 @@ impl<T: Reconcile + Hydrate + Clone> SharedState<T> {
 /// # Type Parameters
 /// - `LocalDataType`: The type of data stored in the additional data map. Must implement
 ///   `Serialize`, `Clone`, and `Debug`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalData<LocalDataType>
 where
     LocalDataType: Serialize + Clone + std::fmt::Debug,
@@ -105,7 +106,7 @@ where
 
 impl<LocalDataType> LocalData<LocalDataType>
 where
-    LocalDataType: Serialize + DeserializeOwned + Clone + std::fmt::Debug + std::marker::Sync,
+    LocalDataType: Serialize + DeserializeOwned + Clone + std::fmt::Debug + Sync,
 {
     /// Creates a new instance of `LocalData` with no private key and an empty additional data map.
     ///
@@ -136,8 +137,8 @@ pub struct AutoSharedDocument<
         + Serialize
         + DeserializeOwned
         + std::fmt::Debug
-        + std::marker::Sync,
-    LocalDataType: DeserializeOwned + Serialize + Clone + std::fmt::Debug + std::marker::Sync,
+        + Sync,
+    LocalDataType: DeserializeOwned + Serialize + Clone + std::fmt::Debug + Sync,
 > {
     /// The Tor client used for secure communication.
     client: TorClient<PreferredRuntime>,
@@ -232,7 +233,7 @@ where
             info!("Tor client started");
 
             // Load or create local data
-            let local_data_path = format!("{}local_only.json", data_dir);
+            let local_data_path = format!("{data_dir}local_only.json");
             let local_data = if Path::new(&local_data_path).exists() {
                 let file = File::open(&local_data_path).expect("Failed to open local_only.json");
                 serde_json::from_reader(file).unwrap_or_else(|_| {
@@ -244,14 +245,14 @@ where
             };
 
             // Load or create shared state
-            let shared_state_path = format!("{}shared_state.json", data_dir);
+            let shared_state_path = format!("{data_dir}shared_state.json");
 
             if Path::new(&shared_state_path).exists() {
                 let file =
                     File::open(&shared_state_path).expect("Failed to open shared_state.json");
                 serde_json::from_reader(file).unwrap_or_else(|_| {
                     eprintln!("Failed to parse shared_state.json, creating new shared state");
-                })
+                });
             };
 
             let mut shared_state = AutoCommit::new();
@@ -313,31 +314,23 @@ where
         let (onion_service, request_stream): (
             _,
             Pin<Box<dyn Stream<Item = tor_hsservice::RendRequest> + Send>>,
-        ) = match self
+        ) = if let Ok((service, stream)) = self
             .client
             .launch_onion_service_with_hsid(svc_cfg.clone(), encodable_key)
         {
-            Ok((service, stream)) => (service, Box::pin(stream)),
-            Err(_) => {
-                // This key exists; reuse it
-                let (service, stream) = self
-                    .client
-                    .launch_onion_service(svc_cfg)
-                    .expect("error creating onion service");
-                (service, Box::pin(stream))
-            }
+            (service, Box::pin(stream))
+        } else {
+            // This key exists; reuse it
+            let (service, stream) = self
+                .client
+                .launch_onion_service(svc_cfg)
+                .expect("error creating onion service");
+            (service, Box::pin(stream))
         };
-
-        eprintln!(
-            "onion service created: {}",
-            onion_service.onion_address().unwrap()
-        );
         info!(
             "onion service created: {}",
             onion_service.onion_address().unwrap()
         );
-
-        eprintln!("status: {:?}", onion_service.status());
         info!("status: {:?}", onion_service.status());
 
         while let Some(status_event) = onion_service.status_events().next().await {
@@ -345,8 +338,6 @@ where
                 break;
             }
         }
-
-        eprintln!("status: {:?}", onion_service.status());
         info!("status: {:?}", onion_service.status());
 
         let shared_state = self.shared_state.clone();
@@ -362,11 +353,9 @@ where
 
                 while let Some(stream_request) = accepted_streams.next().await {
                     info!("new stream");
-                    eprintln!("new stream");
                     let request = stream_request.request().clone();
                     match request {
                         IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
-                            eprintln!("onion_service_stream");
                             let onion_service_stream =
                                 stream_request.accept(Connected::new_empty()).await.unwrap();
                             let io = TokioIo::new(onion_service_stream);
@@ -377,69 +366,11 @@ where
                             http1::Builder::new()
                                 .serve_connection(
                                     io,
-                                    service_fn(|request| async {
-                                        info!("request gotten");
-                                        let path = request.uri().path().to_string();
-                                        let binding = request.headers().clone();
-                                        let signature = binding.get("X-Signature-Ed25519");
-                                        if path == "/shared_state" {
-                                            let message =
-                                                request.collect().await.unwrap().to_bytes();
-                                            let message = String::from_utf8(message.to_vec())
-                                                .expect("error parsing message");
-                                            if let Some(signature) = signature {
-                                                let signature = signature
-                                                    .to_str()
-                                                    .expect("error converting signature to string")
-                                                    .to_string();
-
-                                                let data: SharedState<SharedDataType> =
-                                                    serde_json::from_str::<
-                                                        SharedState<SharedDataType>,
-                                                    >(
-                                                        &message
-                                                    )
-                                                    .map_err(|_| ())
-                                                    .expect("error parsing message to JSON");
-                                                let clone_data = data.clone();
-
-                                                //todo: check if signature is from one of the allowed partners
-
-                                                // Put data into a document
-                                                let mut doc = shared_state
-                                                    .lock()
-                                                    .unwrap()
-                                                    .fork()
-                                                    .with_actor(automerge::ActorId::random());
-                                                reconcile(&mut doc, &clone_data).unwrap();
-
-                                                shared_state
-                                                    .lock()
-                                                    .unwrap()
-                                                    .merge(&mut doc)
-                                                    .expect("TODO: panic message");
-
-                                                let shared_state =
-                                                    shared_state.lock().unwrap().clone();
-                                                let hydrated_state: SharedState<SharedDataType> =
-                                                    hydrate(&shared_state).unwrap();
-                                                // Save the shared state to a file
-                                                Self::save_shared_state_inner(
-                                                    &hydrated_state,
-                                                    data_dir.clone(),
-                                                )
-                                                .unwrap();
-
-                                                eprintln!("Shared state updated: {:?}", clone_data);
-                                                info!("Shared state updated: {:?}", clone_data);
-                                            }
-                                        } else {
-                                            info!("unknown path");
-                                        }
-                                        Ok::<Response<String>, anyhow::Error>(
-                                            Response::builder()
-                                                .status(StatusCode::OK)
-                                                .body("Shared state received".to_string())?,
+                                    service_fn(|request| {
+                                        Self::service_function(
+                                            request,
+                                            shared_state.clone(),
+                                            data_dir.clone(),
                                         )
                                     }),
                                 )
@@ -457,6 +388,88 @@ where
             .expect("error spawning task");
 
         clone_onion_address
+    }
+
+    async fn service_function(
+        request: Request<Incoming>,
+        shared_state: Arc<Mutex<AutoCommit>>,
+        data_dir: String,
+    ) -> Result<Response<String>, anyhow::Error> {
+        info!("request gotten");
+        let path = request.uri().path().to_string();
+        let binding = request.headers().clone();
+        let signature = binding.get("X-Signature-Ed25519");
+        if path == "/shared_state" {
+            let message = request.collect().await.unwrap().to_bytes();
+            let message = String::from_utf8(message.to_vec()).expect("error parsing message");
+            if let Some(signature) = signature {
+                let signature = signature
+                    .to_str()
+                    .expect("error converting signature to string")
+                    .to_string();
+
+                let signature = base64::prelude::BASE64_STANDARD
+                    .decode(signature)
+                    .expect("error decoding signature from base64");
+
+                let data: SharedState<SharedDataType> =
+                    serde_json::from_str::<SharedState<SharedDataType>>(&message)
+                        .map_err(|_| ())
+                        .expect("error parsing message to JSON");
+                let clone_data = data.clone();
+
+                //todo: check if signature is from one of the allowed partners
+                let mut is_from_allowed_addresses = false;
+
+                for address in data.allowed_onion_addresses.iter() {
+                    let public_key = get_public_key_from_onion_address(address);
+                    if verify_signature(&message, &signature, &public_key) {
+                        info!("signature verified");
+                        is_from_allowed_addresses = true;
+                        break;
+                    }
+                }
+
+                if !is_from_allowed_addresses {
+                    eprintln!("signature not from allowed addresses");
+                    info!("signature not from allowed addresses");
+                    return Ok::<Response<String>, anyhow::Error>(
+                        Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body("Signature not from allowed addresses".to_string())?,
+                    );
+                }
+
+                // Put data into a document
+                let mut doc = shared_state
+                    .lock()
+                    .unwrap()
+                    .fork()
+                    .with_actor(automerge::ActorId::random());
+                reconcile(&mut doc, &clone_data).unwrap();
+
+                shared_state
+                    .lock()
+                    .unwrap()
+                    .merge(&mut doc)
+                    .expect("TODO: panic message");
+
+                let shared_state = shared_state.lock().unwrap().clone();
+                let hydrated_state: SharedState<SharedDataType> = hydrate(&shared_state).unwrap();
+                // Save the shared state to a file
+                Self::save_shared_state_inner(&hydrated_state, data_dir.clone()).unwrap();
+
+                eprintln!("Shared state updated: {:?}", clone_data);
+                info!("Shared state updated: {:?}", clone_data);
+            }
+        } else {
+            info!("unknown path");
+        }
+        Ok::<Response<String>, anyhow::Error>(
+            Response::builder()
+                .status(StatusCode::OK)
+                .body("Shared state received".to_string())?,
+        )
     }
 
     async fn send_message_inner(&self, message: &str, recipient: &str, endpoint: &str) -> String {
@@ -672,8 +685,19 @@ where
             .expect("TODO: panic message");
         self.save_shared_state()
     }
-
-    /// Set a local-only value that should not be synchronized
+    /// Sets a local-only value that should not be synchronized with peers.
+    ///
+    /// This method updates the `additional_data` field in the local-only data
+    /// by inserting the specified key-value pair. The updated local data is then
+    /// saved to persistent storage.
+    ///
+    /// # Parameters
+    /// - `key`: A string slice representing the key to be added or updated in the local-only data.
+    /// - `value`: The value of type `LocalDataType` to be associated with the specified key.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the value is successfully set and the local data is saved.
+    /// - `Err(std::io::Error)`: If an error occurs during the saving process.
     pub fn set_local_value(&self, key: &str, value: LocalDataType) -> Result<(), Error> {
         let mut local_data = self.local_data.lock().unwrap();
         local_data.additional_data.insert(key.to_string(), value);
@@ -681,12 +705,24 @@ where
     }
 
     /// Get the private key for the onion service
-    pub fn get_private_key(&self) -> Option<Vec<u8>> {
+    fn get_private_key(&self) -> Option<Vec<u8>> {
         let local_data = self.local_data.lock().unwrap();
         local_data.private_key.clone()
     }
 
-    /// Sync a document with another peer
+    /// Synchronizes the document with other peers.
+    ///
+    /// This method serializes the current shared state into a JSON string and sends it to all
+    /// allowed onion addresses. It uses the `send_message_inner` method to send the data
+    /// asynchronously to each peer. If the synchronization fails for any peer, an error is returned.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the document is successfully synchronized with all peers.
+    /// - `Err(String)`: If an error occurs during serialization or synchronization.
+    ///
+    /// # Errors
+    /// - Returns an error if the shared state cannot be serialized into JSON.
+    /// - Returns an error if the synchronization fails for one or more peers.
     pub fn sync_document(&self) -> Result<(), String> {
         // Serialize the sync message
         let document = self.shared_state.lock().unwrap().clone();
@@ -720,14 +756,26 @@ where
         Ok(())
     }
 
-    /// Get the onion address of this node
+    /// Retrieves the onion address of this node.
+    ///
+    /// This method calculates the onion address using the private key stored in the local data.
+    /// If the private key is not set, it logs a message and returns an empty string.
+    ///
+    /// # Returns
+    /// A `String` containing the onion address of this node. If the private key is not set,
+    /// an empty string is returned.
+    ///
+    /// # Panics
+    /// - If the private key cannot be converted to a `[u8; 32]` array.
+    /// - If the expanded secret key cannot be converted to a `[u8; 64]` array.
+    /// - If the expanded key pair cannot be created from the secret key bytes.
     pub fn get_own_onion_address(&self) -> String {
         // If we have a private key, use it to get the onion address
         let local_data = self.local_data.lock().unwrap();
         let private_key = match local_data.private_key {
             Some(ref key) => key,
             None => {
-                info!("No private key set for this onion service");
+                info!("No private key set for this service");
                 return String::new();
             }
         };
@@ -799,6 +847,21 @@ pub fn get_onion_address(public_key: &[u8]) -> String {
 
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &buf).to_ascii_lowercase()
 }
+
+/// Extracts the public key from a given Tor onion address.
+///
+/// This function attempts to decode the onion address from base32 format and
+/// truncate the resulting vector to the first 32 bytes, which represent the public key.
+///
+/// # Parameters
+/// - `onion_address`: A string slice representing the Tor onion address.
+///
+/// # Returns
+/// A `Vec<u8>` containing the public key extracted from the onion address. If the decoding
+/// fails or an error occurs, an empty vector is returned.
+///
+/// # Panics
+/// - If the decoding process encounters an unrecoverable error.
 pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
     panic::catch_unwind(|| {
         let mut res_vec: Vec<u8> = base32::decode(
