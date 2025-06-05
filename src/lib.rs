@@ -417,8 +417,7 @@ where
                         .map_err(|_| ())
                         .expect("error parsing message to JSON");
                 let clone_data = data.clone();
-
-                //todo: check if signature is from one of the allowed partners
+                
                 let mut is_from_allowed_addresses = false;
 
                 for address in data.allowed_onion_addresses.iter() {
