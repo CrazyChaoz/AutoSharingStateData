@@ -257,7 +257,7 @@ where
 
             let mut shared_state = AutoCommit::new();
             shared_state = shared_state.fork().with_actor(automerge::ActorId::random());
-            reconcile(&mut shared_state, &SharedState::<SharedDataType>::new()).unwrap();
+            reconcile(&mut shared_state, SharedState::<SharedDataType>::new()).unwrap();
 
             let document = AutoSharedDocument {
                 client,
@@ -458,8 +458,8 @@ where
                 // Save the shared state to a file
                 Self::save_shared_state_inner(&hydrated_state, data_dir.clone()).unwrap();
 
-                eprintln!("Shared state updated: {:?}", clone_data);
-                info!("Shared state updated: {:?}", clone_data);
+                eprintln!("Shared state updated: {clone_data:?}");
+                info!("Shared state updated: {clone_data:?}");
             }
         } else {
             info!("unknown path");
@@ -481,7 +481,7 @@ where
         let Ok(stream) = self.client.connect((format!("{host}.onion"), 80)).await else {
             eprintln!("could not connect to recipient");
             info!("could not connect to recipient");
-            return "".to_string();
+            return String::new();
         };
 
         eprintln!("stream connected to {host}");
@@ -578,11 +578,11 @@ where
     ///
     /// # Returns
     /// - `Ok(())`: If the shared state is successfully saved.
-    /// - `Err(std::io::Error)`: If an error occurs during file creation or writing.
+    /// - `Err(Error)`: If an error occurs during file creation or writing.
     fn save_shared_state_inner(
         shared_state: &SharedState<SharedDataType>,
         data_dir: String,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), Error> {
         let shared_state_path = format!("{}shared_state.json", data_dir);
         let file = File::create(&shared_state_path)?;
         serde_json::to_writer_pretty(file, shared_state)?;
@@ -596,8 +596,8 @@ where
     ///
     /// # Returns
     /// - `Ok(())`: If the local data is successfully saved.
-    /// - `Err(std::io::Error)`: If an error occurs during file creation or writing.
-    pub fn save_local_data(&self) -> Result<(), std::io::Error> {
+    /// - `Err(Error)`: If an error occurs during file creation or writing.
+    pub fn save_local_data(&self) -> Result<(), Error> {
         let local_data_path = format!("{}local_only.json", self.data_dir);
         let local_data = self.local_data.lock().unwrap().clone();
         let file = File::create(&local_data_path)?;
@@ -771,13 +771,10 @@ where
     pub fn get_own_onion_address(&self) -> String {
         // If we have a private key, use it to get the onion address
         let local_data = self.local_data.lock().unwrap();
-        let private_key = match local_data.private_key {
-            Some(ref key) => key,
-            None => {
+        let Some(ref private_key) = local_data.private_key else {
                 info!("No private key set for this service");
                 return String::new();
-            }
-        };
+            };
         let sk = <[u8; 32]>::try_from(private_key.as_slice())
             .expect("could not convert private key to [u8; 32]");
         let expanded_secret_key = ed25519_dalek::hazmat::ExpandedSecretKey::from(&sk);
@@ -865,7 +862,7 @@ pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
     panic::catch_unwind(|| {
         let mut res_vec: Vec<u8> = base32::decode(
             base32::Alphabet::Rfc4648Lower { padding: false },
-            &*onion_address.to_ascii_lowercase(),
+            &onion_address.to_ascii_lowercase(),
         )
         .unwrap_or_else(|| {
             eprintln!("error: {onion_address} could not convert from base32");
@@ -885,7 +882,7 @@ pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
 /// This function attempts to verify the signature by:
 /// 1. Converting the public key into a `VerifyingKey`.
 /// 2. Using the `verify` method to check if the signature matches the data.
-/// If the verification fails or an error occurs during the process, it returns `false`.
+///    If the verification fails or an error occurs during the process, it returns `false`.
 ///
 /// # Parameters
 /// - `data`: A string slice representing the data to be verified.
