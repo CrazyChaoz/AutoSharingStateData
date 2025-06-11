@@ -1,16 +1,16 @@
 [package]
 name = "auto-merged-state-data"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
-arti-client = { version= "0.30.0", features=["onion-service-service","onion-service-client","static","experimental-api"] }
-tor-cell = "0.30.0"
-tor-hsservice = "0.30.0"
-tor-proto = "0.30.0"
-tor-rtcompat = { version = "0.30.0", features = ["static"] }
-tor-llcrypto = "0.30.0"
-tor-hscrypto = "0.30.0"
+arti-client = { version= "0.31.0", features=["onion-service-service","onion-service-client","static","experimental-api"] }
+tor-cell = "0.31.0"
+tor-hsservice = "0.31.0"
+tor-proto = "0.31.0"
+tor-rtcompat = { version = "0.31.0", features = ["static"] }
+tor-llcrypto = "0.31.0"
+tor-hscrypto = "0.31.0"
 anyhow = "1.0.86"
 base64 = "0.22.1"
 rand = "0.9.1"

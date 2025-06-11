@@ -8,7 +8,7 @@
 //! use auto_merged_state_data::{generate_key, AutoSharedDocument};
 //!
 //!
-//! let doc:AutoSharedDocument<String,String> = AutoSharedDocument::new("./test_cache1", [42u8; 32]);
+//! let doc:AutoSharedDocument<String,String> = AutoSharedDocument::new("./test_cache1", [42u8; 32], true);
 //!
 //! let partneraddress = "partneraddress.onion".to_string();
 //!
@@ -16,7 +16,6 @@
 //!
 //! doc.set_value("key", "value".to_string()).unwrap();
 //!
-//! let _ = doc.sync_document();
 //! ```
 //!
 
@@ -131,13 +130,7 @@ where
 /// - `LocalDataType`: The type of data stored in the local-only state. Must implement
 ///   `DeserializeOwned`, `Serialize`, `Clone`, `Debug`, and `Sync`.
 pub struct AutoSharedDocument<
-    SharedDataType: Reconcile
-        + Hydrate
-        + Clone
-        + Serialize
-        + DeserializeOwned
-        + std::fmt::Debug
-        + Sync,
+    SharedDataType: Reconcile + Hydrate + Clone + Serialize + DeserializeOwned + std::fmt::Debug + Sync,
     LocalDataType: DeserializeOwned + Serialize + Clone + std::fmt::Debug + Sync,
 > {
     /// The Tor client used for secure communication.
@@ -154,6 +147,9 @@ pub struct AutoSharedDocument<
     /// The path to the directory where data files are stored.
     /// This directory is used for caching and persistence of shared and local data.
     data_dir: String,
+
+    /// Whether to automatically sync the document with peers.
+    auto_sync: bool,
 
     /// A phantom data marker for the `SharedDataType` type parameter.
     /// This is used to ensure the type parameter is retained in the struct's type signature.
@@ -197,9 +193,11 @@ where
     /// - If the cache directory cannot be created.
     /// - If the Tor client configuration fails.
     /// - If the local or shared state files cannot be opened or parsed.
+    #[must_use]
     pub fn new(
         cache_dir: &str,
         onion_address_secret_key: [u8; 32],
+        auto_sync: bool,
     ) -> AutoSharedDocument<SharedDataType, LocalDataType> {
         // Create the data directory if it doesn't exist
         let data_dir = format!("{}{}", cache_dir, std::path::MAIN_SEPARATOR);
@@ -229,7 +227,6 @@ where
         rt.block_on(async {
             let client = client_future.await.unwrap();
 
-            eprintln!("Tor client started");
             info!("Tor client started");
 
             // Load or create local data
@@ -237,7 +234,7 @@ where
             let local_data = if Path::new(&local_data_path).exists() {
                 let file = File::open(&local_data_path).expect("Failed to open local_only.json");
                 serde_json::from_reader(file).unwrap_or_else(|_| {
-                    eprintln!("Failed to parse local_only.json, creating new local data");
+                    info!("Failed to parse local_only.json, creating new local data");
                     LocalData::new()
                 })
             } else {
@@ -247,23 +244,27 @@ where
             // Load or create shared state
             let shared_state_path = format!("{data_dir}shared_state.json");
 
-            if Path::new(&shared_state_path).exists() {
+            let old_data: SharedState<SharedDataType> = if Path::new(&shared_state_path).exists() {
                 let file =
                     File::open(&shared_state_path).expect("Failed to open shared_state.json");
                 serde_json::from_reader(file).unwrap_or_else(|_| {
-                    eprintln!("Failed to parse shared_state.json, creating new shared state");
-                });
+                    info!("Failed to parse shared_state.json, creating new shared state");
+                    SharedState::new()
+                })
+            } else {
+                SharedState::new()
             };
 
             let mut shared_state = AutoCommit::new();
             shared_state = shared_state.fork().with_actor(automerge::ActorId::random());
-            reconcile(&mut shared_state, SharedState::<SharedDataType>::new()).unwrap();
+            reconcile(&mut shared_state, old_data).unwrap();
 
             let document = AutoSharedDocument {
                 client,
                 shared_state: Arc::new(Mutex::new(shared_state)),
                 local_data: Arc::new(Mutex::new(local_data)),
                 data_dir: data_dir.to_string(),
+                auto_sync,
                 _phantom: Default::default(),
             };
 
@@ -417,7 +418,7 @@ where
                         .map_err(|_| ())
                         .expect("error parsing message to JSON");
                 let clone_data = data.clone();
-                
+
                 let mut is_from_allowed_addresses = false;
 
                 for address in data.allowed_onion_addresses.iter() {
@@ -561,10 +562,16 @@ where
     /// # Returns
     /// - `Ok(())`: If the shared state is successfully saved.
     /// - `Err(std::io::Error)`: If an error occurs during the saving process.
-    pub fn save_shared_state(&self) -> Result<(), std::io::Error> {
+    pub fn save_shared_state(&self) -> Result<(), String> {
         let document = self.shared_state.lock().unwrap().clone();
         let shared_state: SharedState<SharedDataType> = hydrate(&document).unwrap();
-        Self::save_shared_state_inner(&shared_state, self.data_dir.clone())
+        let result = Self::save_shared_state_inner(&shared_state, self.data_dir.clone());
+        if self.auto_sync && result.is_ok() {
+            info!("Auto-sync enabled, syncing document");
+            self.sync_document()
+        } else {
+            result.map_err(|e| e.to_string())
+        }
     }
 
     /// Saves the shared state to a file at the specified directory.
@@ -617,7 +624,7 @@ where
     /// # Returns
     /// - `Ok(())`: If the onion address is successfully added and the shared state is saved.
     /// - `Err(std::io::Error)`: If an error occurs during the saving process.
-    pub fn add_allowed_onion_address(&self, address: String) -> Result<(), std::io::Error> {
+    pub fn add_allowed_onion_address(&self, address: String) -> Result<(), String> {
         let mut forked_doc = self
             .shared_state
             .lock()
@@ -667,7 +674,7 @@ where
     /// # Returns
     /// - `Ok(())`: If the value is successfully set and the shared state is saved.
     /// - `Err(std::io::Error)`: If an error occurs during the saving process.
-    pub fn set_value(&self, key: &str, value: SharedDataType) -> Result<(), Error> {
+    pub fn set_value(&self, key: &str, value: SharedDataType) -> Result<(), String> {
         let mut locked_doc = self
             .shared_state
             .lock()
@@ -772,9 +779,9 @@ where
         // If we have a private key, use it to get the onion address
         let local_data = self.local_data.lock().unwrap();
         let Some(ref private_key) = local_data.private_key else {
-                info!("No private key set for this service");
-                return String::new();
-            };
+            info!("No private key set for this service");
+            return String::new();
+        };
         let sk = <[u8; 32]>::try_from(private_key.as_slice())
             .expect("could not convert private key to [u8; 32]");
         let expanded_secret_key = ed25519_dalek::hazmat::ExpandedSecretKey::from(&sk);
@@ -801,6 +808,7 @@ where
 ///
 /// # Returns
 /// A `[u8; 32]` array containing the generated secret key.
+#[must_use]
 pub fn generate_key() -> [u8; 32] {
     let mut rng = rand::rng();
     let mut sk = [0u8; 32];
@@ -824,6 +832,7 @@ pub fn generate_key() -> [u8; 32] {
 ///
 /// # Panics
 /// - If the `public_key` cannot be converted to a `[u8; 32]` array.
+#[must_use]
 pub fn get_onion_address(public_key: &[u8]) -> String {
     let pub_key = <[u8; 32]>::try_from(public_key).expect("could not convert to [u8; 32]");
     let mut buf = [0u8; 35];
@@ -858,6 +867,7 @@ pub fn get_onion_address(public_key: &[u8]) -> String {
 ///
 /// # Panics
 /// - If the decoding process encounters an unrecoverable error.
+#[must_use]
 pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
     panic::catch_unwind(|| {
         let mut res_vec: Vec<u8> = base32::decode(
@@ -895,6 +905,7 @@ pub fn get_public_key_from_onion_address(onion_address: &str) -> Vec<u8> {
 ///
 /// # Panics
 /// - If the `public_key` or `signature` cannot be converted to their respective types.
+#[must_use]
 pub fn verify_signature(data: &str, signature: &[u8], public_key: &[u8]) -> bool {
     panic::catch_unwind(|| {
         let verifying_key =
@@ -980,7 +991,8 @@ mod tests {
 
     #[test]
     fn test_start_server() {
-        let client: AutoSharedDocument<String, String> = AutoSharedDocument::new(".", [42u8; 32]);
+        let client: AutoSharedDocument<String, String> =
+            AutoSharedDocument::new(".", [42u8; 32], true);
         let onion_address = client.get_own_onion_address();
 
         assert_eq!(
@@ -1001,8 +1013,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(cache1);
         let _ = std::fs::remove_dir_all(cache2);
         // Create two documents
-        let doc1: AutoSharedDocument<String, String> = AutoSharedDocument::new(cache1, key1);
-        let doc2: AutoSharedDocument<String, String> = AutoSharedDocument::new(cache2, key2);
+        let doc1: AutoSharedDocument<String, String> = AutoSharedDocument::new(cache1, key1, true);
+        let doc2: AutoSharedDocument<String, String> = AutoSharedDocument::new(cache2, key2, true);
         // Get their onion addresses
         let onion1 = doc1.get_own_onion_address();
         let onion2 = doc2.get_own_onion_address();
@@ -1014,10 +1026,7 @@ mod tests {
 
         // Add data to each document
         doc1.set_value("from1", "hello from 1".to_string()).unwrap();
-        let _ = doc1.sync_document();
-
         doc2.set_value("from2", "hello from 2".to_string()).unwrap();
-        let _ = doc2.sync_document();
 
         // Reload state from disk to check persistence
         let file1 = std::fs::File::open(format!("{}/shared_state.json", cache1)).unwrap();
