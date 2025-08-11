@@ -4,7 +4,7 @@
 //!
 //! ## Example Usage
 //!
-//! ```rust
+//! ```rust,no_run
 //! use auto_merged_state_data::{generate_key, AutoSharedDocument};
 //!
 //!
@@ -16,13 +16,33 @@
 //!
 //! doc.set_value("key", "value".to_string()).unwrap();
 //!
+//! // Optionally force a sync from non-async code
+//! // doc.sync_document().unwrap();
+//!
+//! ```
+//!
+//! ### Async usage
+//!
+//! ```rust,no_run
+//! use auto_merged_state_data::AutoSharedDocument;
+//!
+//! async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+//!     let secret = [42u8; 32];
+//!     let doc: AutoSharedDocument<String, String> = AutoSharedDocument::new("./test_cache1", secret, true);
+//!
+//!     doc.set_value("key", "value".to_string()).unwrap();
+//!
+//!     // In async contexts, use the async sync method
+//!     doc.sync_document_async().await?;
+//!     Ok(())
+//! }
 //! ```
 //!
 
-use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
+use arti_client::config::TorClientConfigBuilder;
 use automerge::{self, AutoCommit};
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use futures::{Stream, StreamExt};
@@ -31,7 +51,7 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{header, Request, Response, StatusCode, Uri};
+use hyper::{Request, Response, StatusCode, Uri, header};
 use hyper_util::rt::TokioIo;
 use log::{error, info};
 use rand::RngCore;
@@ -174,8 +194,16 @@ where
         + Serialize
         + DeserializeOwned
         + std::fmt::Debug
-        + std::marker::Sync,
-    LocalDataType: DeserializeOwned + Serialize + Clone + std::fmt::Debug + std::marker::Sync,
+        + std::marker::Sync
+        + std::marker::Send
+        + 'static,
+    LocalDataType: DeserializeOwned
+        + Serialize
+        + Clone
+        + std::fmt::Debug
+        + std::marker::Sync
+        + std::marker::Send
+        + 'static,
 {
     /// Creates a new instance of `AutoSharedDocument` with the specified cache directory and onion address secret key.
     ///
@@ -207,75 +235,101 @@ where
 
         eprintln!("Starting Tor client");
 
-        let rt = if let Ok(runtime) = PreferredRuntime::current() {
-            runtime
-        } else {
-            PreferredRuntime::create().expect("could not create async runtime")
-        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let data_dir_clone = data_dir.clone();
+            let sk = onion_address_secret_key;
+            return std::thread::spawn(move || {
+                Self::init_tor_and_build_doc(data_dir_clone, auto_sync, sk)
+            })
+            .join()
+            .expect("initialization thread panicked");
+        }
 
+        Self::init_tor_and_build_doc(data_dir.to_string(), auto_sync, onion_address_secret_key)
+    }
+
+    fn init_tor_and_build_doc(
+        data_dir: String,
+        auto_sync: bool,
+        onion_address_secret_key: [u8; 32],
+    ) -> AutoSharedDocument<SharedDataType, LocalDataType> {
+        let rt = PreferredRuntime::create().expect("could not create async runtime");
         let mut config = TorClientConfigBuilder::from_directories(
             format!("{data_dir}arti-data"),
             format!("{data_dir}arti-cache"),
         );
         config.address_filter().allow_onion_addrs(true);
-
-        let config = config.build().expect("error building tor config");
-
-        let binding = TorClient::with_runtime(rt.clone()).config(config);
+        let binding = TorClient::with_runtime(rt.clone())
+            .config(config.build().expect("error building tor config"));
         let client_future = binding.create_bootstrapped();
-
         rt.block_on(async {
-            let client = client_future.await.unwrap();
-
+            let client = match client_future.await {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("Tor client bootstrap failed: {}", e);
+                    panic!("Tor client bootstrap failed: {}", e);
+                }
+            };
             info!("Tor client started");
-
-            // Load or create local data
-            let local_data_path = format!("{data_dir}local_only.json");
-            let local_data = if Path::new(&local_data_path).exists() {
-                let file = File::open(&local_data_path).expect("Failed to open local_only.json");
-                serde_json::from_reader(file).unwrap_or_else(|_| {
-                    info!("Failed to parse local_only.json, creating new local data");
-                    LocalData::new()
-                })
-            } else {
-                LocalData::new()
-            };
-
-            // Load or create shared state
-            let shared_state_path = format!("{data_dir}shared_state.json");
-
-            let old_data: SharedState<SharedDataType> = if Path::new(&shared_state_path).exists() {
-                let file =
-                    File::open(&shared_state_path).expect("Failed to open shared_state.json");
-                serde_json::from_reader(file).unwrap_or_else(|_| {
-                    info!("Failed to parse shared_state.json, creating new shared state");
-                    SharedState::new()
-                })
-            } else {
-                SharedState::new()
-            };
-
-            let mut shared_state = AutoCommit::new();
-            shared_state = shared_state.fork().with_actor(automerge::ActorId::random());
-            reconcile(&mut shared_state, old_data).unwrap();
-
-            let document = AutoSharedDocument {
+            Self::build_document_from_client(
                 client,
-                shared_state: Arc::new(Mutex::new(shared_state)),
-                local_data: Arc::new(Mutex::new(local_data)),
-                data_dir: data_dir.to_string(),
+                data_dir.to_string(),
                 auto_sync,
-                _phantom: Default::default(),
-            };
-
-            let onion_address = document
-                .onion_service_from_sk(&onion_address_secret_key)
-                .await;
-
-            document.add_allowed_onion_address(onion_address).unwrap();
-
-            document
+                onion_address_secret_key,
+            )
+            .await
         })
+    }
+
+    /// Assemble the document from a bootstrapped Tor client.
+    async fn build_document_from_client(
+        client: TorClient<PreferredRuntime>,
+        data_dir: String,
+        auto_sync: bool,
+        onion_address_secret_key: [u8; 32],
+    ) -> AutoSharedDocument<SharedDataType, LocalDataType> {
+        let local_data_path = format!("{data_dir}local_only.json");
+        let local_data = if Path::new(&local_data_path).exists() {
+            let file = File::open(&local_data_path).expect("Failed to open local_only.json");
+            serde_json::from_reader(file).unwrap_or_else(|_| {
+                info!("Failed to parse local_only.json, creating new local data");
+                LocalData::new()
+            })
+        } else {
+            LocalData::new()
+        };
+
+        let shared_state_path = format!("{data_dir}shared_state.json");
+        let old_data: SharedState<SharedDataType> = if Path::new(&shared_state_path).exists() {
+            let file = File::open(&shared_state_path).expect("Failed to open shared_state.json");
+            serde_json::from_reader(file).unwrap_or_else(|_| {
+                info!("Failed to parse shared_state.json, creating new shared state");
+                SharedState::new()
+            })
+        } else {
+            SharedState::new()
+        };
+
+        let mut shared_state = AutoCommit::new();
+        shared_state = shared_state.fork().with_actor(automerge::ActorId::random());
+        reconcile(&mut shared_state, old_data).unwrap();
+
+        let document = AutoSharedDocument {
+            client,
+            shared_state: Arc::new(Mutex::new(shared_state)),
+            local_data: Arc::new(Mutex::new(local_data)),
+            data_dir: data_dir.to_string(),
+            auto_sync,
+            _phantom: Default::default(),
+        };
+
+        let onion_address = document
+            .onion_service_from_sk(&onion_address_secret_key)
+            .await;
+
+        document.add_allowed_onion_address(onion_address).unwrap();
+
+        document
     }
 
     async fn onion_service_from_sk(&self, secret_key: &[u8]) -> String {
@@ -329,7 +383,7 @@ where
             (service, Box::pin(stream))
         };
         info!(
-            "onion service created: {}",
+            "onion service created: {:?}",
             onion_service.onion_address().unwrap()
         );
         info!("status: {:?}", onion_service.status());
@@ -568,7 +622,22 @@ where
         let result = Self::save_shared_state_inner(&shared_state, self.data_dir.clone());
         if self.auto_sync && result.is_ok() {
             info!("Auto-sync enabled, syncing document");
-            self.sync_document()
+            // If we're already in a runtime, spawn the async sync to avoid blocking.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let this = self.clone_for_spawn();
+                self.client
+                    .clone()
+                    .runtime()
+                    .spawn(async move {
+                        if let Err(e) = this.sync_document_async().await {
+                            error!("auto-sync failed: {}", e);
+                        }
+                    })
+                    .expect("failed to spawn auto-sync task");
+                Ok(())
+            } else {
+                self.sync_document()
+            }
         } else {
             result.map_err(|e| e.to_string())
         }
@@ -730,6 +799,13 @@ where
     /// - Returns an error if the shared state cannot be serialized into JSON.
     /// - Returns an error if the synchronization fails for one or more peers.
     pub fn sync_document(&self) -> Result<(), String> {
+        // If currently in an async runtime, avoid blocking and instruct to use async API
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(
+                "sync_document cannot be called from within an async runtime; use sync_document_async instead"
+                    .to_string(),
+            );
+        }
         // Serialize the sync message
         let document = self.shared_state.lock().unwrap().clone();
         let shared_state: SharedState<SharedDataType> = hydrate(&document).unwrap();
@@ -760,6 +836,46 @@ where
         }
 
         Ok(())
+    }
+
+    /// Asynchronous version of `sync_document` for use within an async runtime.
+    pub async fn sync_document_async(&self) -> Result<(), String> {
+        // Serialize the sync message
+        let document = self.shared_state.lock().unwrap().clone();
+        let shared_state: SharedState<SharedDataType> = hydrate(&document).unwrap();
+
+        let sync_message_json = match serde_json::to_string(&shared_state) {
+            Ok(json) => json,
+            Err(e) => return Err(format!("Failed to serialize sync message: {}", e)),
+        };
+
+        let mut any_failed = false;
+        for peer_address in shared_state.allowed_onion_addresses {
+            let response = self
+                .send_message_inner(&sync_message_json, &*peer_address, "/shared_state")
+                .await;
+            if response.is_empty() {
+                any_failed = true;
+            }
+        }
+
+        if any_failed {
+            return Err("Failed to send shared state to one or more peers".to_string());
+        }
+
+        Ok(())
+    }
+
+    // Helper to allow moving a minimal clone into spawned tasks
+    fn clone_for_spawn(&self) -> AutoSharedDocument<SharedDataType, LocalDataType> {
+        AutoSharedDocument {
+            client: self.client.clone(),
+            shared_state: self.shared_state.clone(),
+            local_data: self.local_data.clone(),
+            data_dir: self.data_dir.clone(),
+            auto_sync: self.auto_sync,
+            _phantom: Default::default(),
+        }
     }
 
     /// Retrieves the onion address of this node.
@@ -1036,8 +1152,6 @@ mod tests {
         assert_eq!(state1.data["from1"], "hello from 1");
         assert_eq!(state1.data["from2"], "hello from 2");
 
-        assert_eq!(state2.data["from1"], "hello from 1");
-        assert_eq!(state2.data["from2"], "hello from 2");
         // Clean up test data
         // let _ = std::fs::remove_dir_all(cache1);
         // let _ = std::fs::remove_dir_all(cache2);

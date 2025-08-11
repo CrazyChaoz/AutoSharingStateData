@@ -23,17 +23,17 @@ use auto_merged_state_data::{generate_key, AutoSharedDocument};
 // Generate a new secret key for your onion service
 let secret_key = generate_key();
 
-// Create a new collaborative document (shared state)
-let doc: AutoSharedDocument<String, String> = AutoSharedDocument::new("./test_cache1", secret_key);
+// Create a new collaborative document (shared state). The last flag enables auto-sync on save.
+let doc: AutoSharedDocument<String, String> = AutoSharedDocument::new("./test_cache1", secret_key, true);
 
 // Add a peer's onion address to the allowed list
 let partner_address = "partneraddress.onion".to_string();
 doc.add_allowed_onion_address(partner_address.clone()).unwrap();
 
-// Set a value in the shared state
+// Set a value in the shared state (will auto-sync if enabled)
 doc.set_value("key", "value".to_string()).unwrap();
 
-// Synchronize the document with all allowed peers
+// Or explicitly sync from sync code
 doc.sync_document().unwrap();
 ```
 
@@ -45,11 +45,12 @@ doc.sync_document().unwrap();
 - `LocalData<T>`: Represents local-only data (private key and additional local data).
 
 ### Main Methods
-- `AutoSharedDocument::new(cache_dir, secret_key)`: Create a new document and onion service.
+- `AutoSharedDocument::new(cache_dir, secret_key, auto_sync)`: Create a new document and onion service.
 - `add_allowed_onion_address(address)`: Allow a peer to sync with you.
 - `set_value(key, value)`: Set a value in the shared state.
 - `set_local_value(key, value)`: Set a value in the local-only state.
 - `sync_document()`: Send the current shared state to all allowed peers.
+- `sync_document_async()`: Async version of `sync_document()` for async contexts.
 - `get_own_onion_address()`: Get your onion address (identity).
 
 ### Security
