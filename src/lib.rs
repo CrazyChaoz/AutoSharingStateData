@@ -834,6 +834,9 @@ where
 
         let mut any_failed = false;
         for peer_address in shared_state.allowed_onion_addresses {
+            if peer_address == self.get_own_onion_address() {
+                continue; // Skip empty addresses
+            }
             // Send the sync message to the peer
             let runtime = self.client.runtime().clone();
             runtime.block_on(async {
