@@ -779,6 +779,23 @@ where
         self.save_local_data()
     }
 
+    /// Returns a snapshot of the shared `data` map.
+    ///
+    /// Locks and hydrates the current document, then clones and returns
+    /// the `data` HashMap from the shared state.
+    pub fn get_shared_data(&self) -> HashMap<String, SharedDataType> {
+        let document = self.shared_state.lock().unwrap().clone();
+        let shared_state: SharedState<SharedDataType> = hydrate(&document).unwrap();
+        shared_state.data.clone()
+    }
+
+    /// Returns a snapshot of the local-only `additional_data` map.
+    ///
+    /// Locks the local data and clones the internal BTreeMap.
+    pub fn get_local_data(&self) -> BTreeMap<String, LocalDataType> {
+        self.local_data.lock().unwrap().additional_data.clone()
+    }
+
     /// Get the private key for the onion service
     fn get_private_key(&self) -> Option<Vec<u8>> {
         let local_data = self.local_data.lock().unwrap();
